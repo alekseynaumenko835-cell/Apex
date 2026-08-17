@@ -286,8 +286,8 @@ function evaluateAt(symbol, series, i) {
   let structureHits = 0;
   for (let j = i - 7; j <= i; j++) {
     if (j <= 0) continue;
-    if (trendDirection === 'long' if (direction === 'long' && highsif (direction === 'long' && highs highs[j] >= highs[j - 1] && lows[j] >= lows[j - 1]) structureHits++;
-    if (trendDirection === 'short' if (direction === 'short' && highsif (direction === 'short' && highs highs[j] <= highs[j - 1] && lows[j] <= lows[j - 1]) structureHits++;
+    if (trendDirection === 'long' && highs[j] >= highs[j - 1] && lows[j] >= lows[j - 1]) structureHits++;
+    if (trendDirection === 'short' && highs[j] <= highs[j - 1] && lows[j] <= lows[j - 1]) structureHits++;
   }
   const structureScore = structureHits / 8;
   const recentVol = vols.slice(i - 4, i + 1).reduce((x, y) => x + y, 0) / 5;
