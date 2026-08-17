@@ -281,12 +281,13 @@ function evaluateAt(symbol, series, i) {
   const longAligned = price > a && a > b;
   const shortAligned = price < a && a < b;
   if (!longAligned && !shortAligned) return null;
-  const direction = longAligned ? 'long' : 'short';
+  const trendDirection = longAligned ? 'long' : 'short';
+  const direction = trendDirection === 'long' ? 'short' : 'long';
   let structureHits = 0;
   for (let j = i - 7; j <= i; j++) {
     if (j <= 0) continue;
-    if (direction === 'long' && highs[j] >= highs[j - 1] && lows[j] >= lows[j - 1]) structureHits++;
-    if (direction === 'short' && highs[j] <= highs[j - 1] && lows[j] <= lows[j - 1]) structureHits++;
+    if (trendDirection === 'long' if (direction === 'long' && highsif (direction === 'long' && highs highs[j] >= highs[j - 1] && lows[j] >= lows[j - 1]) structureHits++;
+    if (trendDirection === 'short' if (direction === 'short' && highsif (direction === 'short' && highs highs[j] <= highs[j - 1] && lows[j] <= lows[j - 1]) structureHits++;
   }
   const structureScore = structureHits / 8;
   const recentVol = vols.slice(i - 4, i + 1).reduce((x, y) => x + y, 0) / 5;
