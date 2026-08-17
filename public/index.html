@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>APEX — live</title>
+<style>
+  :root{ --bg:#0a0e1a; --panel:#12172a; --dim:#6b7590; --lo:#9aa4c0; --long:#22d3a8; --short:#ff5d7a; --warn:#FFD23F; --border:#232a45; }
+  *{box-sizing:border-box;}
+  body{margin:0; background:var(--bg); color:#dfe4f5; font-family:'SF Mono',ui-monospace,Menlo,Consolas,monospace; padding:14px; padding-bottom:60px;}
+  .topbar{display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;}
+  .title{font-size:15px; letter-spacing:.08em; color:var(--lo);}
+  .badge{font-size:10px; padding:3px 8px; border-radius:20px; border:1px solid var(--border);}
+  .badge.normal{color:var(--long); border-color:var(--long);}
+  .badge.paused, .badge.flattened{color:var(--warn); border-color:var(--warn);}
+  .badge.hard{color:var(--short); border-color:var(--short);}
+  .grid{display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:14px;}
+  .panel{background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:12px;}
+  .label{color:var(--dim); font-size:10px; text-transform:uppercase; letter-spacing:.05em; margin-bottom:6px;}
+  .big{font-size:22px; font-weight:700;}
+  .up{color:var(--long);} .down{color:var(--short);}
+  .row{display:flex; justify-content:space-between; padding:7px 0; border-bottom:1px solid var(--border); font-size:12px;}
+  .row:last-child{border-bottom:none;}
+  .section-title{color:var(--dim); font-size:10px; text-transform:uppercase; letter-spacing:.05em; margin:16px 0 8px;}
+  .log-line{font-size:11px; padding:5px 0; border-bottom:1px solid var(--border); color:var(--lo); line-height:1.4;}
+  .log-line.open{color:var(--long);} .log-line.close-pos{color:var(--lo);} .log-line.warn{color:var(--warn);}
+  button{background:transparent; border:1px solid var(--border); color:var(--lo); padding:8px 14px; border-radius:8px; font-family:inherit; font-size:11px;}
+  .hardstop{background:rgba(255,93,122,.08); border:1px solid var(--short); border-radius:10px; padding:10px; margin-bottom:12px; font-size:12px; color:var(--short);}
+  a{color:var(--lo);}
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="title">APEX · live</div>
+    <div id="statusBadge" class="badge normal">—</div>
+  </div>
+
+  <div id="hardStopBox"></div>
+
+  <div class="grid">
+    <div class="panel"><div class="label">Equity</div><div class="big" id="equity">—</div></div>
+    <div class="panel"><div class="label">Total Return</div><div class="big" id="ret">—</div></div>
+    <div class="panel"><div class="label">Open Positions</div><div class="big" id="posCount">—</div></div>
+    <div class="panel"><div class="label">Portfolio Heat</div><div class="big" id="heat">—</div></div>
+  </div>
+
+  <div class="panel" style="margin-bottom:14px; font-size:11px; color:var(--dim); display:flex; justify-content:space-between; flex-wrap:wrap; gap:6px;">
+    <span id="uptime">uptime —</span>
+    <span id="scans">scans —</span>
+    <span id="regime">vol/risk mult —</span>
+  </div>
+
+  <div class="section-title">Open Positions</div>
+  <div class="panel" id="positions"><div class="row"><span style="color:var(--dim)">none</span></div></div>
+
+  <div class="section-title">Log</div>
+  <div class="panel" id="log" style="max-height:340px; overflow-y:auto;"></div>
+
+  <div style="margin-top:16px; text-align:center;">
+    <button onclick="resumeBot()">🔓 resume after hard-stop</button>
+  </div>
+
+<script>
+async function resumeBot(){
+  if(!confirm('Сбросить hard-stop и продолжить торговлю?')) return;
+  await fetch('/api/resume', {method:'POST'});
+  load();
+}
+function fmtUsd(v){ return (v>=0?'$':'-$') + Math.abs(v).toFixed(0); }
+function fmtPct(v){ return (v>=0?'+':'') + v.toFixed(1) + '%'; }
+function fmtAgo(ms){
+  const s = Math.floor(ms/1000);
+  if(s<60) return s+'s ago';
+  const m = Math.floor(s/60); if(m<60) return m+'m ago';
+  const h = Math.floor(m/60); if(h<24) return h+'h ago';
+  return Math.floor(h/24)+'d ago';
+}
+async function load(){
+  let st;
+  try{ st = await (await fetch('/api/state')).json(); }
+  catch(e){ document.getElementById('statusBadge').textContent='offline'; return; }
+
+  const badge = document.getElementById('statusBadge');
+  if(st.hardStopped){ badge.textContent='HARD STOP'; badge.className='badge hard'; }
+  else { badge.textContent = st.breakerState; badge.className = 'badge ' + st.breakerState; }
+
+  document.getElementById('hardStopBox').innerHTML = st.hardStopped
+    ? '<div class="hardstop">⛔ Hard stop active — drawdown ceiling hit. Trading halted. Press resume below if you want to continue.</div>' : '';
+
+  const ret = ((st.equity - st.startBalance)/st.startBalance)*100;
+  document.getElementById('equity').textContent = fmtUsd(st.equity);
+  const retEl = document.getElementById('ret'); retEl.textContent = fmtPct(ret); retEl.className='big '+(ret>=0?'up':'down');
+  document.getElementById('posCount').textContent = st.positions.length + ' / ' + st.cfg.MAX_POSITIONS;
+  const heatEl = document.getElementById('heat'); heatEl.textContent = st.portfolioHeatPct.toFixed(1)+'%';
+  heatEl.className = 'big ' + (st.portfolioHeatPct > st.cfg.PORTFOLIO_HEAT_CAP_PCT*0.8 ? 'down':'');
+
+  document.getElementById('uptime').textContent = 'uptime ' + fmtAgo(st.uptimeMs);
+  document.getElementById('scans').textContent = 'scans ' + st.scanCount + ' / universe ' + st.universeCount;
+  document.getElementById('regime').textContent = 'vol×' + st.volRegimeMult.toFixed(2) + ' risk×' + st.riskMultiplier.toFixed(2) + (st.cooldown?' [cooldown]':'');
+
+  const posEl = document.getElementById('positions');
+  posEl.innerHTML = st.positions.length ? st.positions.map(p=>{
+    const move = p.direction==='long' ? (p.lastPrice-p.entry)/p.entry : (p.entry-p.lastPrice)/p.entry;
+    const marginPct = move*p.leverage*100;
+    return '<div class="row"><span>'+p.direction.toUpperCase()+' '+p.symbol+'</span><span class="'+(marginPct>=0?'up':'down')+'">'+fmtPct(marginPct)+'</span></div>';
+  }).join('') : '<div class="row"><span style="color:var(--dim)">none</span></div>';
+
+  document.getElementById('log').innerHTML = st.log.map(l=>
+    '<div class="log-line '+(l.cls||'')+'">'+new Date(l.t).toLocaleTimeString()+' — '+l.msg+'</div>'
+  ).join('');
+}
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>

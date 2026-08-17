@@ -1,0 +1,16 @@
+{
+  "name": "apex-trend-scanner",
+  "version": "1.0.0",
+  "description": "APEX — 24/7 multi-symbol trend scanner (paper trading) for Binance USDⓈ-M futures",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
