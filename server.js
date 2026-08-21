@@ -4,6 +4,10 @@
 // rendering, wrapped in an HTTP server so it can run 24/7 on Railway and be
 // checked from a phone browser instead of a laptop tab that has to stay open.
 // Still PAPER TRADING ONLY — no real orders, no API keys, no funds at risk.
+//
+// INVERTED MODE: bot fades the trend.
+// Strong uptrend (good coin) → opens SHORT
+// Strong downtrend           → opens LONG
 // ============================================================================
 const express = require('express');
 const fs = require('fs');
@@ -64,6 +68,12 @@ const CFG = {
   ROTATE_MIN_HOLD_MS: 40 * 60_000,
   ROTATE_COOLDOWN_MS: 30 * 60_000,
   MAX_TOTAL_DD_PCT: 35,
+
+  // ---- adaptive regime switch (fade-the-trend vs trend-follow) ----
+  REGIME_WINDOW_MS: 8 * 3600_000,      // rolling window to judge current mode's profitability
+  REGIME_MIN_TRADES: 4,                // don't judge on too few samples — noise
+  REGIME_FLIP_LOSS_PCT: 3,             // window realized PnL <= -3% of startBalance → flip
+  REGIME_FLIP_COOLDOWN_MS: 8 * 3600_000, // can't flip again sooner than this — prevents flapping
 };
 
 // ---------- state (persisted to disk so a Railway restart doesn't lose the run) ----------
@@ -75,6 +85,7 @@ let S = {
   winStreak: 0, lossStreak: 0, cooldown: false,
   atrHistory: [], volRegimeMult: 1, riskMultiplier: 1, portfolioHeatPct: 0, lastRotationAt: null,
   startedAt: Date.now(),
+  fadeMode: true, lastRegimeFlipAt: null, regimeFlipCount: 0,
 };
 
 function loadState() {
@@ -272,7 +283,7 @@ function computeSeries(klines) {
   const ts = klines.map(k => +k[0]);
   return { ts, highs, lows, closes, vols, e20: ema(closes, 20), e50: ema(closes, 50), adxArr: adx(highs, lows, closes, 14).adx, atrArr: atrPctSeries(highs, lows, closes, 14) };
 }
-function evaluateAt(symbol, series, i) {
+function evaluateAt(symbol, series, i, fadeMode) {
   const { highs, lows, closes, vols, e20, e50, adxArr, atrArr } = series;
   if (i < 60 || i >= closes.length) return null;
   const adxNow = adxArr[i];
@@ -282,10 +293,14 @@ function evaluateAt(symbol, series, i) {
   const shortAligned = price < a && a < b;
   if (!longAligned && !shortAligned) return null;
   const trendDirection = longAligned ? 'long' : 'short';
-  const direction = trendDirection === 'long' ? 'short' : 'long';
+  // fadeMode=true  → counter-trend (uptrend → SHORT, downtrend → LONG)
+  // fadeMode=false → trend-follow  (uptrend → LONG,  downtrend → SHORT)
+  // mode is decided live by checkRegimeFlip() based on realized PnL, not hardcoded
+  const direction = fadeMode ? (trendDirection === 'long' ? 'short' : 'long') : trendDirection;
   let structureHits = 0;
   for (let j = i - 7; j <= i; j++) {
     if (j <= 0) continue;
+    // Structure score still measures the strength of the *trend* we are fading
     if (trendDirection === 'long' && highs[j] >= highs[j - 1] && lows[j] >= lows[j - 1]) structureHits++;
     if (trendDirection === 'short' && highs[j] <= highs[j - 1] && lows[j] <= lows[j - 1]) structureHits++;
   }
@@ -300,10 +315,34 @@ function evaluateAt(symbol, series, i) {
   const atrPct = atrArr[i] || 0.02;
   return { symbol, direction, price, adx: adxNow, composite, atrPct, volMult };
 }
-function scoreSymbol(symbol, klines) {
+function scoreSymbol(symbol, klines, fadeMode) {
   if (!klines || klines.length < 60) return null;
   const series = computeSeries(klines);
-  return evaluateAt(symbol, series, series.closes.length - 1);
+  return evaluateAt(symbol, series, series.closes.length - 1, fadeMode);
+}
+
+// ---------- adaptive regime switch ----------
+// Looks at realized PnL of trades closed within the last REGIME_WINDOW_MS.
+// If the current mode has been net-losing beyond the threshold, flips
+// fadeMode and flattens open positions (their direction assumption no
+// longer holds once the mode changes).
+function checkRegimeFlip() {
+  const now = Date.now();
+  const recent = S.history.filter(h => now - h.closedAt <= CFG.REGIME_WINDOW_MS);
+  if (recent.length < CFG.REGIME_MIN_TRADES) return;
+  if (S.lastRegimeFlipAt && (now - S.lastRegimeFlipAt) < CFG.REGIME_FLIP_COOLDOWN_MS) return;
+
+  const pnlSum = recent.reduce((s, h) => s + h.pnlUsd, 0);
+  const pnlPctOfBalance = (pnlSum / S.startBalance) * 100;
+  if (pnlPctOfBalance > -CFG.REGIME_FLIP_LOSS_PCT) return;
+
+  S.fadeMode = !S.fadeMode;
+  S.lastRegimeFlipAt = now;
+  S.regimeFlipCount = (S.regimeFlipCount || 0) + 1;
+  pushLog(`🔁 REGIME FLIP #${S.regimeFlipCount}: ${recent.length} trades over last ${(CFG.REGIME_WINDOW_MS / 3600000).toFixed(0)}h netted ${pnlSum >= 0 ? '+' : ''}$${pnlSum.toFixed(2)} (${pnlPctOfBalance.toFixed(1)}% of balance) — switching to ${S.fadeMode ? 'FADE (counter-trend)' : 'TREND-FOLLOW'} mode`, 'warn');
+
+  // flatten positions opened under the old regime's direction logic
+  [...S.positions].forEach(p => { if (p.lastPrice != null) closePosition(p, exitPrice(p), 'regime-flip'); });
 }
 
 let scanning = false;
@@ -321,7 +360,7 @@ async function scanMarket() {
   for (let i = 0; i < universe.length; i += CHUNK) {
     const chunk = universe.slice(i, i + CHUNK);
     const settled = await Promise.allSettled(chunk.map(sym => fj(`${BASE}/klines?symbol=${sym}&interval=${CFG.KLINE_INTERVAL}&limit=${CFG.KLINE_LIMIT}`)));
-    settled.forEach((r, idx) => { if (r.status === 'fulfilled') { const sc = scoreSymbol(chunk[idx], r.value); if (sc) results.push(sc); } });
+    settled.forEach((r, idx) => { if (r.status === 'fulfilled') { const sc = scoreSymbol(chunk[idx], r.value, S.fadeMode); if (sc) results.push(sc); } });
     await new Promise(r => setTimeout(r, 150));
   }
   results.sort((a, b) => b.composite - a.composite);
@@ -539,6 +578,8 @@ async function tickPositions() {
       closePosition(pos, exitPrice(pos), reason);
     }
   });
+
+  checkRegimeFlip();
   saveState();
 }
 
@@ -546,6 +587,7 @@ async function tickPositions() {
 // HTTP layer
 // ============================================================================
 const app = express();
+app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/api/state', (req, res) => {
@@ -560,6 +602,7 @@ app.get('/api/state', (req, res) => {
     riskMultiplier: S.riskMultiplier, volRegimeMult: S.volRegimeMult,
     portfolioHeatPct: S.portfolioHeatPct, cooldown: S.cooldown, winStreak: S.winStreak, lossStreak: S.lossStreak,
     startedAt: S.startedAt, uptimeMs: Date.now() - S.startedAt,
+    fadeMode: S.fadeMode, lastRegimeFlipAt: S.lastRegimeFlipAt, regimeFlipCount: S.regimeFlipCount || 0,
     cfg: { MAX_POSITIONS: CFG.MAX_POSITIONS, MAX_TOTAL_DD_PCT: CFG.MAX_TOTAL_DD_PCT, PORTFOLIO_HEAT_CAP_PCT: CFG.PORTFOLIO_HEAT_CAP_PCT },
   });
 });
@@ -572,6 +615,22 @@ app.post('/api/resume', (req, res) => {
   pushLog(`🔓 manual resume via API — peak tracking reset to $${eq.toFixed(0)}`, 'info');
   saveState();
   res.json({ ok: true });
+});
+
+// Manual regime override — force fade/trend-follow mode without waiting for the
+// auto-flip logic. Flattens open positions on switch, same as an auto-flip.
+app.post('/api/regime', (req, res) => {
+  const { fadeMode } = req.body || {};
+  if (typeof fadeMode !== 'boolean') return res.status(400).json({ error: 'body must be { "fadeMode": true|false }' });
+  if (fadeMode !== S.fadeMode) {
+    S.fadeMode = fadeMode;
+    S.lastRegimeFlipAt = Date.now();
+    S.regimeFlipCount = (S.regimeFlipCount || 0) + 1;
+    pushLog(`🔁 REGIME FLIP #${S.regimeFlipCount} (manual): switching to ${S.fadeMode ? 'FADE (counter-trend)' : 'TREND-FOLLOW'} mode`, 'warn');
+    [...S.positions].forEach(p => { if (p.lastPrice != null) closePosition(p, exitPrice(p), 'regime-flip-manual'); });
+    saveState();
+  }
+  res.json({ ok: true, fadeMode: S.fadeMode });
 });
 
 app.listen(PORT, () => {
